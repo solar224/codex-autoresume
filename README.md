@@ -9,7 +9,7 @@ A lightweight background daemon and Webview patch for the official OpenAI Codex 
 
 ### Install
 ```bash
-git clone [https://github.com/YOUR_USERNAME/codex-autoresume.git](https://github.com/YOUR_USERNAME/codex-autoresume.git)
+git clone https://github.com/solar224/codex-autoresume.git(https://github.com/solar224/codex-autoresume.git)
 cd codex-autoresume
 chmod +x install.sh uninstall.sh
 ./install.sh
