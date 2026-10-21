@@ -5,13 +5,6 @@ REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SERVICE_NAME="codex-autoresume.service"
 SYSTEMD_DIR="$HOME/.config/systemd/user"
 
-for bak in ~/.vscode-server/extensions/openai.chatgpt-*/webview/assets/app-initial-*.js.orig.bak \
-           ~/.vscode/extensions/openai.chatgpt-*/webview/assets/app-initial-*.js.orig.bak; do
-  if [ -f "$bak" ]; then
-    cp "$bak" "${bak%.orig.bak}"
-  fi
-done
-
 mkdir -p "$SYSTEMD_DIR"
 
 cat << SERVICE_EOF > "$SYSTEMD_DIR/$SERVICE_NAME"
