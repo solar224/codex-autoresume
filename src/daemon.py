@@ -2,6 +2,7 @@
 
 import glob
 import hashlib
+import json
 import os
 import re
 import shutil
@@ -9,12 +10,18 @@ import time
 from datetime import datetime
 from pathlib import Path
 
+try:
+    from src.quota import read_rate_limits
+except ModuleNotFoundError:
+    from quota import read_rate_limits
+
 BASE_DIR = Path(__file__).resolve().parent.parent
 PAYLOAD_FILE = BASE_DIR / "src" / "payload.js"
 PLUGIN_TAG_RE = re.compile(
     r'<script type="module" src="\./assets/codex-ar-plugin(?:-[0-9a-f]{12})?\.js"></script>'
 )
 OLD_MARKER = "/* CODEX_AUTORESUME_START */"
+QUOTA_FILE = "codex-ar-quota.json"
 
 
 def log(message):
@@ -61,6 +68,10 @@ def patch_webview(webview):
 
     restore_legacy_bundles(webview)
     payload = PAYLOAD_FILE.read_bytes()
+    asset = assets_dir / payload_name(payload)
+    if not asset.exists() or asset.read_bytes() != payload:
+        atomic_write(asset, payload)
+        log(f"Updated: {asset}")
     tag = script_tag(payload)
     backup = Path(str(html_path) + ".orig.bak")
     current = html_path.read_text(encoding="utf-8")
@@ -79,24 +90,45 @@ def patch_webview(webview):
     before_body, _, after_body = clean_html.partition("</body>")
     updated = f"{before_body.rstrip()}\n  {tag}\n</body>{after_body}"
     if updated != current:
-        html_path.write_text(updated, encoding="utf-8")
+        atomic_write(html_path, updated.encode("utf-8"))
         log(f"Patched: {html_path}")
 
-    for name in (payload_name(payload), "codex-ar-plugin.js"):
-        target = assets_dir / name
-        if not target.exists() or target.read_bytes() != payload:
-            target.write_bytes(payload)
-            log(f"Updated: {target}")
+
+def atomic_write(path, content):
+    temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    try:
+        temporary.write_bytes(content)
+        os.replace(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def write_quota_snapshot(webview, snapshot):
+    assets = webview / "assets"
+    if not assets.is_dir():
+        return
+    target = assets / QUOTA_FILE
+    atomic_write(target, (json.dumps(snapshot, separators=(",", ":")) + "\n").encode("utf-8"))
 
 
 def main():
     log("Codex Auto-Resume daemon started")
+    next_quota_read = 0
     while True:
-        for webview in extension_webviews():
+        webviews = list(extension_webviews())
+        for webview in webviews:
             try:
                 patch_webview(webview)
             except (OSError, UnicodeError) as error:
                 log(f"Could not patch {webview}: {error}")
+        if webviews and time.monotonic() >= next_quota_read:
+            next_quota_read = time.monotonic() + 60
+            try:
+                snapshot = read_rate_limits(timeout=20)
+                for webview in webviews:
+                    write_quota_snapshot(webview, snapshot)
+            except (OSError, RuntimeError, TimeoutError) as error:
+                log(f"Could not refresh quota: {type(error).__name__}")
         time.sleep(30)
 
 

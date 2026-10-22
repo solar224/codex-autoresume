@@ -1,4 +1,5 @@
 import importlib.util
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -11,6 +12,14 @@ spec.loader.exec_module(daemon)
 
 
 class PatchWebviewTest(unittest.TestCase):
+    def test_quota_snapshot_contains_only_reported_fields(self):
+        with tempfile.TemporaryDirectory() as directory:
+            webview = Path(directory)
+            (webview / "assets").mkdir()
+            snapshot = {"observedAt": 123, "ordinaryUsageAllowed": True, "buckets": {}}
+            daemon.write_quota_snapshot(webview, snapshot)
+            self.assertEqual(json.loads((webview / "assets" / daemon.QUOTA_FILE).read_text()), snapshot)
+
     def test_patch_is_repeatable_and_tracks_extension_updates(self):
         with tempfile.TemporaryDirectory() as directory:
             webview = Path(directory)
@@ -21,11 +30,14 @@ class PatchWebviewTest(unittest.TestCase):
             tag = daemon.script_tag(daemon.PAYLOAD_FILE.read_bytes())
             asset = assets / daemon.payload_name(daemon.PAYLOAD_FILE.read_bytes())
 
-            daemon.patch_webview(webview)
+            with patch.object(daemon, "atomic_write", wraps=daemon.atomic_write) as write:
+                daemon.patch_webview(webview)
+            written = [call.args[0] for call in write.call_args_list]
+            self.assertLess(written.index(asset), written.index(html),
+                            "the script must exist before index.html references it")
             self.assertEqual(html.read_text().count(tag), 1)
             self.assertEqual((webview / "index.html.orig.bak").read_text(), "<html><body>v1</body></html>")
             self.assertEqual(asset.read_bytes(), daemon.PAYLOAD_FILE.read_bytes())
-            self.assertEqual((assets / "codex-ar-plugin.js").read_bytes(), daemon.PAYLOAD_FILE.read_bytes())
 
             patched = html.read_text()
             daemon.patch_webview(webview)
