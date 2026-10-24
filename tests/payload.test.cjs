@@ -9,7 +9,8 @@ const MINUTE = 60_000;
 function setup({ message = "You've hit your usage limit. Try again in 1 minute.", nativeRetry = false,
   legacyBadge = false, role = 'alert', editorKind = 'textarea', unlabelledBanner = false,
   sendKeepsDraft = false, startAt = '2026-10-21T12:00:00', quotaSnapshot = null,
-  route = '/index.html', quotaControl = false, sendAppearsAfterText = false } = {}) {
+  route = '/index.html', quotaControl = false, sendAppearsAfterText = false,
+  writerConflictAtStart = false } = {}) {
   let now = Date.parse(startAt);
   let interval;
   let badge;
@@ -18,7 +19,9 @@ function setup({ message = "You've hit your usage limit. Try again in 1 minute."
   const roots = [];
   const sends = [];
   const retries = [];
+  const writerRetries = [];
   const refreshes = [];
+  let writerLocked = true;
   const listeners = {};
   const document = {
     body: {}, activeElement: null,
@@ -28,6 +31,8 @@ function setup({ message = "You've hit your usage limit. Try again in 1 minute."
       if (selector === '[data-codex-composer-root]') return roots;
       if (selector === '[role="alert"], [role="status"]') return alerts.filter((alert) =>
         alert.isConnected && ['alert', 'status'].includes(alert.getAttribute('role')));
+      if (selector === '[role="alert"]') return alerts.filter((alert) =>
+        alert.isConnected && alert.getAttribute('role') === 'alert');
       if (selector === 'button' && quotaControl) return [{
         id: '', disabled: false, innerText: 'Rate limit', title: '', isConnected: true,
         getAttribute: () => '', getClientRects: () => [{}],
@@ -85,6 +90,7 @@ function setup({ message = "You've hit your usage limit. Try again in 1 minute."
 
   function addConversation() {
     const box = editorKind === 'contenteditable' ? new FakeEditable() : new FakeTextArea();
+    box.attachments = [];
     const stop = { isConnected: true, getClientRects: () => [{}], getAttribute: () => 'Stop' };
     const send = {
       isConnected: true, forceDisabled: false, ariaBlocked: false, type: 'button',
@@ -98,7 +104,8 @@ function setup({ message = "You've hit your usage limit. Try again in 1 minute."
       click() {
         assert.equal(this.disabled || this.ariaBlocked, false, 'native Send must be enabled before clicking');
         if (sendKeepsDraft) return;
-        sends.push({ at: now, text: box.value ?? box.innerText, root });
+        sends.push({ at: now, text: box.value ?? box.innerText,
+          attachments: [...box.attachments], root });
         if (box.value === undefined) box.innerText = '';
         else box.value = '';
       },
@@ -147,8 +154,33 @@ function setup({ message = "You've hit your usage limit. Try again in 1 minute."
     return alert;
   }
 
+  function showWriterConflict() {
+    first.root.isConnected = false;
+    const retry = {
+      isConnected: true, disabled: false, innerText: '重試',
+      getAttribute: () => null, getClientRects: () => [{}],
+      click() {
+        writerRetries.push(now);
+        if (!writerLocked) {
+          alert.isConnected = false;
+          first.root.isConnected = true;
+        }
+      },
+    };
+    const alert = {
+      isConnected: true,
+      innerText: '已在另一個應用程式中開啟。請先在該處關閉，才能在此處繼續。',
+      getAttribute: (name) => name === 'role' ? 'alert' : null,
+      querySelectorAll: (selector) => selector === 'button' ? [retry] : [],
+      getClientRects: () => [{}],
+    };
+    alerts.push(alert);
+    return alert;
+  }
+
   const first = addConversation();
   addAlert();
+  if (writerConflictAtStart) showWriterConflict();
   vm.runInNewContext(source, context);
   function advance(ms) {
     assert.equal(ms % 1000, 0);
@@ -157,7 +189,9 @@ function setup({ message = "You've hit your usage limit. Try again in 1 minute."
       interval();
     }
   }
-  return { advance, addConversation, addAlert, alerts, roots, sends, retries, refreshes, first, window, document,
+  return { advance, addConversation, addAlert, showWriterConflict, alerts, roots, sends, retries,
+    writerRetries, refreshes, first, window, document,
+    releaseWriter() { writerLocked = false; },
     setGenerating(value) { generating = value; },
     trustedClick(target) { listeners.click({ isTrusted: true, target }); },
     get badge() { return badge; } };
@@ -450,9 +484,68 @@ function setup({ message = "You've hit your usage limit. Try again in 1 minute."
 {
   const app = setup();
   app.first.box.value = 'my unsent draft';
-  app.advance(4 * MINUTE);
-  assert.equal(app.sends.length, 0, 'an unsent draft is preserved');
+  app.first.box.attachments = ['image-1', 'image-2'];
+  app.advance(3 * MINUTE - 1000);
+  assert.equal(app.sends.length, 0, 'the existing draft waits for quota recovery');
   assert.equal(app.first.box.value, 'my unsent draft');
+  app.advance(1000);
+  assert.equal(app.sends.length, 1, 'the existing draft is sent after recovery');
+  assert.equal(app.sends[0].text, 'my unsent draft', 'the existing message is not replaced');
+  assert.deepEqual(app.sends[0].attachments, ['image-1', 'image-2'],
+    'native Send includes the existing attachments');
+  app.advance(2 * MINUTE);
+  assert.equal(app.sends.length, 1, 'the old limit alert does not resend the draft');
+}
+
+{
+  const app = setup();
+  app.first.box.value = 'draft being edited';
+  app.advance(3 * MINUTE - 1000);
+  app.first.box.value = 'draft with final details';
+  app.advance(1000);
+  assert.equal(app.sends.length, 0, 'a recently edited draft is not sent at reset');
+  app.advance(9000);
+  assert.equal(app.sends.length, 0, 'the draft needs ten seconds without edits');
+  app.advance(1000);
+  assert.equal(app.sends.length, 1);
+  assert.equal(app.sends[0].text, 'draft with final details');
+}
+
+{
+  const app = setup({ nativeRetry: true });
+  app.showWriterConflict();
+  app.advance(3 * MINUTE);
+  assert.equal(app.sends.length, 0, 'Send waits while another app owns the conversation');
+  assert.equal(app.window.codexAutoResume.inspect().writerConflict, true);
+  assert.ok(app.writerRetries.length >= 2, 'only the writer-conflict card is retried');
+  assert.equal(app.retries.length, 0, 'the response Retry button is not clicked');
+  app.releaseWriter();
+  app.advance(MINUTE + 2000);
+  assert.equal(app.sends.length, 1, 'the pending continuation sends after the writer is released');
+  assert.equal(app.sends[0].text, 'Continue from where you left off.');
+}
+
+{
+  const app = setup({ writerConflictAtStart: true });
+  assert.equal(app.window.codexAutoResume.inspect().pending, true,
+    'a limit notice remains pending when the composer is unavailable at load');
+  app.releaseWriter();
+  app.advance(3 * MINUTE + 2000);
+  assert.equal(app.sends.length, 1,
+    'the continuation sends after opening a previously locked conversation');
+}
+
+{
+  const app = setup();
+  const conflict = app.showWriterConflict();
+  app.advance(3 * MINUTE);
+  conflict.isConnected = false;
+  app.advance(5000);
+  assert.equal(app.window.codexAutoResume.inspect().pending, true,
+    'the pending message survives the gap between conflict dismissal and composer render');
+  app.first.root.isConnected = true;
+  app.advance(2000);
+  assert.equal(app.sends.length, 1);
 }
 
 {
@@ -533,6 +626,7 @@ console.log('payload behavior tests passed');
     message: '你已達使用上限。',
     quotaSnapshot: weeklySnapshot,
   });
+  weeklyBlocked.first.box.value = 'queued after weekly reset';
   await new Promise(setImmediate);
   weeklyBlocked.advance(5 * MINUTE);
   assert.equal(weeklyBlocked.sends.length, 0,
@@ -545,7 +639,8 @@ console.log('payload behavior tests passed');
   await new Promise(setImmediate);
   weeklyBlocked.advance(2000);
   assert.equal(weeklyBlocked.sends.length, 1,
-    'a fresh weekly recovery snapshot releases the single pending continuation');
+    'a fresh weekly recovery snapshot releases the single pending message');
+  assert.equal(weeklyBlocked.sends[0].text, 'queued after weekly reset');
 
   const weeklyRemainingZero = setup({
     quotaSnapshot: { observedAt, ordinaryUsageAllowed: true, buckets: {

@@ -8,6 +8,8 @@
   const CONTINUE_TEXT = 'Continue from where you left off.';
   const RETRY_DELAY = 60_000;
   const EDITOR_SETTLE_DELAY = 1000;
+  const USER_DRAFT_IDLE_DELAY = 10_000;
+  const WRITER_RETRY_DELAY = 60_000;
   const RESET_GRACE = 2 * 60_000;
   const FALLBACK_DELAY = RESET_GRACE;
   const LIMIT_RE = /(?:you(?:'|’)ve|you have|you)\s+(?:hit|reached|exceeded)\s+(?:your\s+|the\s+)?(?:(?:maximum|daily|weekly)\s+)?(?:usage\s+|message\s+|messages\s+|rate\s+)?limit|\b(?:usage|rate|message|messages)\s+limit\b|\blimit\s+(?:reached|exceeded)\b|out of (?:messages|usage)|too many requests|已達(?:到)?.{0,20}(?:上限|限制)|用量.{0,10}(?:耗盡|上限(?!已重置|已重設|已恢復))|訊息已用完|速率限制(?!已重設|已重置)|訊息.{0,12}(?:上限|用完)/i;
@@ -15,6 +17,7 @@
   let pending = null;
   let quota = null;
   let nextQuotaRead = 0;
+  let nextWriterRetry = 0;
   const handled = new WeakMap();
   const handledThreads = new Map();
 
@@ -63,7 +66,7 @@
       if (!Number.isFinite(result?.observedAt)) return;
       quota = result;
       const delay = quotaDelay();
-      if (pending && delay === 1000 && pending.nextAt > Date.now() + 1000) {
+      if (pending && !pending.verifying && delay === 1000 && pending.nextAt > Date.now() + 1000) {
         pending.nextAt = Date.now() + 1000;
         pending.reason = 'Server reports quota available; trying native Send';
       } else if (pending && quotaBlocked()) {
@@ -123,6 +126,23 @@
   function generating(root) {
     return Array.from(root?.querySelectorAll('button[aria-label]') || []).some((button) =>
       visible(button) && /^(stop|停止)$/i.test((button.getAttribute('aria-label') || '').trim()));
+  }
+
+  function writerConflict() {
+    return Array.from(document.querySelectorAll('[role="alert"]'))
+      .filter(visible)
+      .find((alert) => /This is open in another app|已在另一個應用程式中開啟|已在另一个应用程序中打开/i
+        .test(alert.innerText || alert.textContent || '')) || null;
+  }
+
+  function retryWriterConflict(alert) {
+    if (Date.now() < nextWriterRetry) return;
+    const retry = Array.from(alert.querySelectorAll('button')).find((button) =>
+      visible(button) && !sendBlocked(button) &&
+      /^(?:retry|重試|重试)$/i.test((button.innerText || button.textContent || '').trim()));
+    if (!retry) return;
+    nextWriterRetry = Date.now() + WRITER_RETRY_DELAY;
+    retry.click();
   }
 
   function limitNotice(root = composerRoot()) {
@@ -211,11 +231,23 @@
     const root = composerRoot();
     if (!root || window.location.href !== state.url) return false;
     if (root === state.root) return true;
-    if (!state.threadKey || state.threadKey !== conversationKey()) return false;
+    if (state.threadKey) {
+      if (state.threadKey !== conversationKey()) return false;
+    } else if (state.root || !visible(state.notice)) return false;
     state.root = root;
     state.box = editor(root);
-    state.ownDraft = editorText(state.box) === CONTINUE_TEXT;
+    state.ownDraft = state.ownDraft && editorText(state.box) === CONTINUE_TEXT;
     return true;
+  }
+
+  function observeDraft(state) {
+    const draft = editorText(editor(state.root));
+    if (draft !== state.draftText) {
+      state.draftText = draft;
+      state.draftChangedAt = Date.now();
+      if (state.ownDraft && draft !== CONTINUE_TEXT) state.ownDraft = false;
+    }
+    return draft;
   }
 
   function conversationKey() {
@@ -257,8 +289,12 @@
       verifying: false,
       wasGenerating: false,
       ownDraft: false,
+      draftText: editorText(editor(root)),
+      draftChangedAt: Date.now(),
       box: null,
       lastAction: null,
+      submittedDraft: '',
+      composerMissingSince: null,
       attemptNotice: null,
       attemptSignature: '',
       refreshStage: 0,
@@ -301,20 +337,24 @@
       state.reason = 'Composer editor not found';
       return;
     }
-    const draft = editorText(box);
+    const draft = observeDraft(state);
     if (state.ownDraft && !draft) state.ownDraft = false;
     if (draft && !(state.ownDraft && draft === CONTINUE_TEXT)) {
-      state.nextAt = Date.now() + RETRY_DELAY; // Keep the user's draft unchanged.
-      state.reason = 'User draft present';
-      return;
+      const idleUntil = state.draftChangedAt + USER_DRAFT_IDLE_DELAY;
+      if (Date.now() < idleUntil) {
+        state.nextAt = idleUntil;
+        state.reason = 'Waiting for the existing draft to settle';
+        return;
+      }
     }
-    if (!state.ownDraft) {
+    if (!draft) {
       if (!insertContinuation(box)) {
         state.nextAt = Date.now() + RETRY_DELAY;
         state.reason = 'Could not enter continuation text';
         return;
       }
       state.ownDraft = true;
+      observeDraft(state);
       state.box = box;
       state.nextAt = Date.now() + EDITOR_SETTLE_DELAY;
       state.reason = 'Continuation entered; waiting for Send';
@@ -323,7 +363,7 @@
     const send = sendButton(state.root);
     if (!send) {
       state.nextAt = Date.now() + RETRY_DELAY;
-      state.reason = 'Continuation entered; waiting for Send button';
+      state.reason = 'Waiting for the native Send button';
       return;
     }
     if (!sameConversation(state) || sendBlocked(send)) {
@@ -333,12 +373,15 @@
       state.reason = sendBlocked(send) ? 'Send button disabled; retrying' : 'Conversation changed';
       return;
     }
+    const submittedDraft = editorText(box);
     try { send.click(); } catch {
       state.nextAt = Date.now() + RETRY_DELAY;
       state.reason = 'Send click failed';
       return;
     }
     state.lastAction = 'send';
+    state.submittedDraft = submittedDraft;
+    state.box = box;
     state.attemptNotice = notice;
     state.attemptSignature = noticeSignature(notice, state.root);
     state.verifying = true;
@@ -349,7 +392,12 @@
   function verifyAttempt(state) {
     const notice = limitNotice();
     const draft = editorText(editor(state.root));
-    if (state.lastAction === 'send' && state.ownDraft && draft === CONTINUE_TEXT) {
+    if (draft && draft !== state.submittedDraft) {
+      markHandled(state.attemptNotice || state.notice, state.root);
+      pending = null;
+      return;
+    }
+    if (state.lastAction === 'send' && draft === state.submittedDraft) {
       state.verifying = false;
       state.nextAt = Date.now() + RETRY_DELAY;
       state.reason = 'Send did not clear the draft; retrying';
@@ -435,12 +483,30 @@
   function poll() {
     readQuota();
     const root = composerRoot();
+    const conflict = writerConflict();
     mountButton(root);
-    if (!enabled || !root) {
+    if (!enabled) {
       pending = null;
       renderStatus();
       return;
     }
+    if (!root || (conflict && !editor(root))) {
+      if (pending && window.location.href !== pending.url) pending = null;
+      if (pending && !conflict) {
+        pending.composerMissingSince ??= Date.now();
+        if (Date.now() - pending.composerMissingSince > 30_000) pending = null;
+      } else if (pending) pending.composerMissingSince = null;
+      if (conflict) {
+        const notice = limitNotice(root);
+        if (!pending && notice && !isHandled(notice, root)) startPending(notice, root);
+        if (pending) pending.reason = 'Conversation open in another app; waiting for writer';
+        retryWriterConflict(conflict);
+      }
+      renderStatus();
+      return;
+    }
+    if (pending) pending.composerMissingSince = null;
+    nextWriterRetry = 0;
     const notice = limitNotice();
     if (!notice) {
       handled.delete(root);
@@ -450,6 +516,7 @@
       markHandled(pending.notice, pending.root);
       pending = null;
     }
+    if (pending) observeDraft(pending);
     if (generating(root)) {
       if (pending) {
         pending.wasGenerating = true;
@@ -501,6 +568,7 @@
         sendDisabled: send ? sendBlocked(send) : null, limitDetected: !!notice,
         limitHandled: isHandled(notice, root),
         limitSource: notice === root ? 'composer' : notice?.getAttribute?.('role') || null,
+        writerConflict: !!writerConflict(),
         quota: freshQuota(),
         pending: !!pending, nextAt: pending ? new Date(pending.nextAt).toISOString() : null,
         reason: pending?.reason || null
